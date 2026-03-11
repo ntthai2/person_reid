@@ -1,0 +1,93 @@
+model:
+  backbone: openai/clip-vit-base-patch16
+  embed_dim: 512
+  proj_hidden_dim: 512
+  proj_out_dim: 512
+  init_temperature: 0.07          # learnable log(1/temp) initialized here
+
+data:
+  root: data
+  image_size: 224
+  text_image:
+    cuhk_pedes:
+      enabled: true
+      parquet_dir: data/text/CUHK-PEDES/data
+    icfg_pedes:
+      enabled: true
+      csv: data/text/ICFG-PEDES/captions_cleaned.csv
+      img_root: data/text/ICFG-PEDES/imgs
+    rstp_reid:
+      enabled: true
+      json: data/text/RSTPReid/data_captions.json
+      img_root: data/text/RSTPReid/imgs
+    iiitd_20k:
+      enabled: true
+      json: data/text/IIITD-20K/Filtered.json
+      img_root: data/text/IIITD-20K/IIITD-20K
+    orbench:
+      enabled: true
+      json: data/image/ORBench/train_annos.json
+      img_root: data/image/ORBench
+  image_only:
+    duke:
+      enabled: true
+      train_dir: data/image/DukeMTMC-reID/bounding_box_train
+      query_dir: data/image/DukeMTMC-reID/query
+      gallery_dir: data/image/DukeMTMC-reID/bounding_box_test
+    market:
+      enabled: true
+      train_dir: data/image/Market-1203/Market1203
+    last:
+      enabled: true
+      train_dir: data/image/last/train
+      val_dir: data/image/last/val
+    caviar:
+      enabled: true
+      img_dir: data/image/CAVIARa
+    grid:
+      enabled: true
+      mat_file: data/image/underground_reid/features_and_partitions.mat
+      probe_dir: data/image/underground_reid/probe
+      gallery_dir: data/image/underground_reid/gallery
+
+training:
+  # Phase 1 — text+image only
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  max_epochs: 20
+  warmup_epochs: 2
+
+  # Mixed precision: null (FP32), "bf16" (Blackwell-safe, ~7.7GB VRAM), or "fp16" (not supported on Blackwell)
+  amp_dtype: bf16
+
+  lr_backbone: 1.0e-5
+  lr_heads: 1.0e-4
+  weight_decay: 0.01
+  optimizer: adamw
+  scheduler: cosine
+
+  loss_weights:
+    infonce: 1.0
+    id: 1.0
+
+  # Phase 3 — multi-task (set > 0 to enable image-only branch)
+  lambda_img: 0.0
+  triplet_margin: 0.3
+
+  # Logging
+  log_dir: runs/baseline
+  log_interval: 10           # steps (lower for early monitoring)
+  eval_interval: 1           # epochs
+
+  # Reproducibility
+  seed: 42
+  num_workers: 8
+  pin_memory: true
+
+evaluation:
+  # Primary eval dataset for text->image
+  primary: rstp_reid
+  # Run image->image eval (requires Phase 3 data)
+  eval_image_reid: false
+  faiss_use_gpu: true
+  k_values: [1, 5, 10]

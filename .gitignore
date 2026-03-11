@@ -1,0 +1,7 @@
+/.venv
+/.vscode
+/data
+/runs
+/outputs
+/__pycache__
+*.pyc
