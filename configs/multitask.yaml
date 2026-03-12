@@ -1,0 +1,118 @@
+# Phase 3 — Multi-Task (text-image contrastive + image-only triplet)
+# Warm-started from Phase 1 best checkpoint (ckpt_epoch16.pt).
+# Image-only datasets add discriminative visual structure via triplet loss
+# without any cross-modal text supervision.
+#
+# Usage:
+#   python scripts/train.py --config configs/multitask.yaml \
+#       --init-from outputs/baseline_run1/ckpt_epoch16.pt \
+#       --checkpoint-dir outputs/multitask_run1 \
+#       --no-eval > runs/train_multitask_run1.log 2>&1
+
+model:
+  backbone: openai/clip-vit-base-patch16
+  embed_dim: 512
+  proj_hidden_dim: 512
+  proj_out_dim: 512
+  init_temperature: 0.07
+  min_temperature: 0.04  # floor to prevent collapse
+
+  # No local-alignment head in Phase 3 (phase 3 is image-only multi-task)
+  local_align:
+    enabled: false
+    n_layers: 2
+    n_heads: 8
+    dropout: 0.1
+
+data:
+  root: data
+  image_size: 224
+  text_image:
+    cuhk_pedes:
+      enabled: true
+      parquet_dir: data/text/CUHK-PEDES/data
+    icfg_pedes:
+      enabled: true
+      csv: data/text/ICFG-PEDES/captions_cleaned.csv
+      json: data/text/ICFG-PEDES/ICFG-PEDES.json
+      img_root: data/text/ICFG-PEDES/imgs
+    rstp_reid:
+      enabled: true
+      json: data/text/RSTPReid/data_captions.json
+      img_root: data/text/RSTPReid/imgs
+    iiitd_20k:
+      enabled: true
+      json: data/text/IIITD-20K/Filtered.json
+      img_root: data/text/IIITD-20K/IIITD-20K
+    orbench:
+      enabled: true
+      json: data/image/ORBench/train_annos.json
+      img_root: data/image/ORBench
+  image_only:
+    duke:
+      enabled: true
+      train_dir: data/image/DukeMTMC-reID/bounding_box_train
+      query_dir: data/image/DukeMTMC-reID/query
+      gallery_dir: data/image/DukeMTMC-reID/bounding_box_test
+    market:
+      enabled: true
+      train_dir: data/image/Market-1203/Market1203
+    last:
+      enabled: true
+      train_dir: data/image/last/train
+      val_dir: data/image/last/val
+    caviar:
+      enabled: true
+      img_dir: data/image/CAVIARa
+    ward:
+      enabled: true
+      img_dir: data/image/WARD
+    grid:
+      enabled: false   # GRID is a test benchmark (250 singletons, no useful positives for triplet)
+
+training:
+  batch_size: 64
+  gradient_accumulation_steps: 1
+  max_epochs: 10           # 10 epochs warm-started from Phase 1
+
+  amp_dtype: bf16
+
+  lr_backbone: 5.0e-6
+  lr_heads: 5.0e-5
+  weight_decay: 0.01
+  optimizer: adamw
+  scheduler: cosine
+
+  loss_weights:
+    infonce: 1.0
+    id: 1.0
+
+  mlm_mask_prob: 0.15      # unused (local_align disabled)
+  lambda_mlm: 0.0
+
+  lambda_img: 0.3          # image-only triplet loss weight
+  triplet_margin: 0.3
+
+  warmup_epochs: 1
+  log_dir: runs/multitask
+  log_interval: 10
+  eval_interval: 1
+
+  seed: 42
+  num_workers: 8
+  pin_memory: true
+
+evaluation:
+  primary: rstp_reid
+  secondary_text_image:
+    - orbench           # large-scale text→image benchmark (18,050 pairs)
+  eval_image_reid: true   # enable DukeMTMC + ENTIRe-ID image→image eval for Phase 3
+  faiss_use_gpu: true
+  k_values: [1, 5, 10]
+  image_reid_datasets:
+    duke:
+      gallery_dir: data/image/DukeMTMC-reID/bounding_box_test
+      query_dir: data/image/DukeMTMC-reID/query
+    entire_id:
+      gallery_dir: data/image/ENTIRe-ID_test/bounding_box_test
+      # no separate query dir; uses gallery as query (self-match excluded)

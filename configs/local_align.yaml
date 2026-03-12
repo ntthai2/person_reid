@@ -1,10 +1,25 @@
+
+# Phase 2 — Local Alignment (cross-attention + MLM)
+# Warm-started from Phase 1 best checkpoint (ckpt_epoch16.pt)
+#
+# Usage:
+#   python scripts/train.py --config configs/local_align.yaml \
+#       --init-from outputs/baseline_run1/ckpt_epoch16.pt \
+#       --checkpoint-dir outputs/local_align_run1 \
+#       --no-eval > runs/train_local_align_run1.log 2>&1
+
 model:
   backbone: openai/clip-vit-base-patch16
   embed_dim: 512
   proj_hidden_dim: 512
   proj_out_dim: 512
   init_temperature: 0.07
-  min_temperature: 0.04  # floor to prevent collapse (logit_scale ≤ log(1/0.04)≈3.22)          # learnable log(1/temp) initialized here
+  min_temperature: 0.04  # floor to prevent collapse
+  local_align:
+    enabled: true
+    n_layers: 2          # cross-attention depth (text→image)
+    n_heads: 8
+    dropout: 0.1
 
 data:
   root: data
@@ -16,7 +31,7 @@ data:
     icfg_pedes:
       enabled: true
       csv: data/text/ICFG-PEDES/captions_cleaned.csv
-      json: data/text/ICFG-PEDES/ICFG-PEDES.json   # has split field; used for eval
+      json: data/text/ICFG-PEDES/ICFG-PEDES.json
       img_root: data/text/ICFG-PEDES/imgs
     rstp_reid:
       enabled: true
@@ -53,17 +68,15 @@ data:
       gallery_dir: data/image/underground_reid/gallery
 
 training:
-  # Phase 1 — text+image only
   batch_size: 64
   gradient_accumulation_steps: 1
-  max_epochs: 20
-  warmup_epochs: 2
+  max_epochs: 10           # Phase 2 fine-tunes for 10 additional epochs
 
-  # Mixed precision: null (FP32), "bf16" (Blackwell-safe, ~7.7GB VRAM), or "fp16" (not supported on Blackwell)
   amp_dtype: bf16
 
-  lr_backbone: 1.0e-5
-  lr_heads: 1.0e-4
+  # Phase 2: slightly lower LR (warm starting from Phase 1)
+  lr_backbone: 5.0e-6
+  lr_heads: 5.0e-5
   weight_decay: 0.01
   optimizer: adamw
   scheduler: cosine
@@ -72,24 +85,27 @@ training:
     infonce: 1.0
     id: 1.0
 
-  # Phase 3 — multi-task (set > 0 to enable image-only branch)
-  lambda_img: 0.0
+  # MLM (local alignment)
+  mlm_mask_prob: 0.15      # fraction of text tokens to predict
+  lambda_mlm: 1.0          # MLM loss weight
+
+  lambda_img: 0.0          # Phase 3 disabled
   triplet_margin: 0.3
 
-  # Logging
-  log_dir: runs/baseline
-  log_interval: 10           # steps (lower for early monitoring)
-  eval_interval: 1           # epochs
+  warmup_epochs: 1         # 1-epoch LR warmup (shorter since warm-started)
 
-  # Reproducibility
+  log_dir: runs/local_align
+  log_interval: 10
+  eval_interval: 1
+
   seed: 42
   num_workers: 8
   pin_memory: true
 
 evaluation:
-  # Primary eval dataset for text->image
   primary: rstp_reid
-  # Run image->image eval (requires Phase 3 data)
+  secondary_text_image:
+    - orbench           # large-scale text→image benchmark (18,050 pairs)
   eval_image_reid: false
   faiss_use_gpu: true
   k_values: [1, 5, 10]
