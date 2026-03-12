@@ -4,6 +4,7 @@ Loss functions for cross-modal person retrieval.
   InfoNCELoss  — symmetric bidirectional contrastive loss.
   IDLoss       — softmax cross-entropy over identity classes.
   TripletLoss  — batch-hard triplet loss (Phase 3 image-only branch).
+  MLMLoss      — masked language modelling loss (Phase 2 local alignment).
 """
 
 from __future__ import annotations
@@ -126,3 +127,46 @@ class TripletLoss(nn.Module):
             loss = torch.log1p(torch.exp(pos_dist - neg_dist))
 
         return loss.mean()
+
+
+# ---------------------------------------------------------------------------
+# MLM loss  (Phase 2 — local alignment)
+# ---------------------------------------------------------------------------
+
+class MLMLoss(nn.Module):
+    """Masked Language Modelling cross-entropy.
+
+    Computes cross-entropy only at positions where *mlm_mask* is True.
+    The model predicts original token ids from image-cross-attended
+    text hidden states (see LocalAlignModule).
+
+    Args:
+        label_smoothing: Optional label smoothing for regularisation.
+    """
+
+    def __init__(self, label_smoothing: float = 0.0):
+        super().__init__()
+        self.label_smoothing = label_smoothing
+
+    def forward(
+        self,
+        mlm_logits: torch.Tensor,    # (B, N_txt, vocab_size)
+        target_ids: torch.Tensor,    # (B, N_txt) — original (unmasked) token ids
+        mlm_mask: torch.Tensor,      # (B, N_txt) bool — True = masked position
+    ) -> torch.Tensor:
+        if mlm_mask.sum() == 0:
+            return mlm_logits.new_tensor(0.0)
+
+        # Flatten and select only masked positions
+        B, N, V = mlm_logits.shape
+        flat_logits = mlm_logits.reshape(B * N, V)
+        flat_targets = target_ids.reshape(B * N)
+        flat_mask = mlm_mask.reshape(B * N)
+
+        masked_logits = flat_logits[flat_mask]
+        masked_targets = flat_targets[flat_mask]
+
+        return F.cross_entropy(
+            masked_logits, masked_targets,
+            label_smoothing=self.label_smoothing,
+        )
