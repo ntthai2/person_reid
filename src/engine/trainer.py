@@ -23,9 +23,13 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import CLIPProcessor
 
 from src.datasets.text_image import build_text_image_dataset, collate_text_image
-from src.datasets.image_only import build_image_only_dataset, collate_image_only
+from src.datasets.image_only import (
+    build_image_only_dataset,
+    collate_image_only,
+    IdentityBalancedSampler,
+)
 from src.models.dual_encoder import build_model
-from src.losses.contrastive import InfoNCELoss, IDLoss, TripletLoss
+from src.losses.contrastive import InfoNCELoss, IDLoss, TripletLoss, MLMLoss
 
 
 # ---------------------------------------------------------------------------
@@ -75,13 +79,21 @@ class Trainer:
         self.use_image_only = tcfg["lambda_img"] > 0
         if self.use_image_only:
             io_datasets, self.io_num_pids = build_image_only_dataset(cfg, split="train")
-            self.train_io_loader = DataLoader(
-                ConcatDataset(io_datasets),
+            io_concat = ConcatDataset(io_datasets)
+            # Build flat pid list for balanced sampling (P identities × K images)
+            io_pid_list = []
+            for ds in io_datasets:
+                io_pid_list.extend(ds.pids)
+            io_sampler = IdentityBalancedSampler(
+                pid_list=io_pid_list,
+                num_instances=4,
                 batch_size=tcfg["batch_size"],
-                shuffle=True,
+            )
+            self.train_io_loader = DataLoader(
+                io_concat,
+                batch_sampler=io_sampler,
                 num_workers=tcfg["num_workers"],
                 pin_memory=tcfg["pin_memory"],
-                drop_last=True,
                 collate_fn=collate_image_only,
                 persistent_workers=tcfg["num_workers"] > 0,
             )
@@ -101,6 +113,13 @@ class Trainer:
             embed_dim=cfg["model"]["proj_out_dim"],
             num_classes=max(ti_num_classes, 1),  # use actual labeled identity count
         ).to(self.device)
+
+        # Phase 2: MLM loss (enabled when model has local_align)
+        self.use_local_align = self.model.use_local_align
+        if self.use_local_align:
+            self.mlm_loss = MLMLoss(label_smoothing=0.1)
+            self.mlm_mask_prob = tcfg.get("mlm_mask_prob", 0.15)
+            self.lambda_mlm = tcfg.get("lambda_mlm", 1.0)
 
         if self.use_image_only:
             self.triplet = TripletLoss(margin=tcfg["triplet_margin"])
@@ -150,6 +169,31 @@ class Trainer:
         )
         return enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
 
+    def _make_mlm_mask(
+        self,
+        input_ids: torch.Tensor,      # (B, N)
+        attention_mask: torch.Tensor, # (B, N)
+    ) -> torch.Tensor:
+        """Create boolean MLM mask (15% of valid, non-BOS/EOS tokens).
+
+        BOS (position 0) and EOS (last non-pad position) are never masked.
+        Returns bool tensor of shape (B, N), True = position is predicted.
+        """
+        B, N = input_ids.shape
+        probs = torch.rand(B, N, device=input_ids.device)
+        active = attention_mask.bool()
+
+        # EOS = last active position per row (vectorised)
+        eos_pos = active.sum(dim=1) - 1   # (B,) index of EOS
+        eos_mask = torch.zeros(B, N, dtype=torch.bool, device=input_ids.device)
+        eos_mask.scatter_(1, eos_pos.unsqueeze(1), True)
+
+        # Maskable: active, not BOS (col 0), not EOS
+        maskable = active & ~eos_mask
+        maskable[:, 0] = False
+
+        return maskable & (probs < self.mlm_mask_prob)
+
     # ------------------------------------------------------------------
     # Train one epoch
     # ------------------------------------------------------------------
@@ -176,15 +220,26 @@ class Trainer:
             input_ids, attention_mask = self._tokenize(texts)
 
             with torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype is not None)):
-                img_emb, txt_emb, logit_scale = self.model(
-                    images, input_ids, attention_mask
-                )
+                if self.use_local_align:
+                    # Phase 2: local alignment forward with MLM
+                    mlm_mask = self._make_mlm_mask(input_ids, attention_mask)
+                    img_emb, txt_emb, logit_scale, mlm_logits = self.model.forward_local(
+                        images, input_ids, attention_mask, mlm_mask=mlm_mask
+                    )
+                    loss_mlm = self.mlm_loss(mlm_logits, input_ids, mlm_mask)
+                else:
+                    img_emb, txt_emb, logit_scale = self.model(
+                        images, input_ids, attention_mask
+                    )
+                    loss_mlm = None
 
                 loss_nce = self.infonce(img_emb, txt_emb, logit_scale)
                 loss_id = self.id_loss(img_emb, txt_emb, pids)
                 loss = w_nce * loss_nce + w_id * loss_id
+                if loss_mlm is not None:
+                    loss = loss + self.lambda_mlm * loss_mlm
 
-                # Image-only branch
+                # Image-only branch (Phase 3)
                 if self.use_image_only and io_iter is not None:
                     try:
                         io_images, io_pids, _ = next(io_iter)
@@ -194,10 +249,10 @@ class Trainer:
                     io_images = io_images.to(self.device)
                     io_pids = io_pids.to(self.device)
                     io_emb = self.model.encode_image(io_images)
+                    # Triplet only — image-only pids are in a separate id-space
+                    # separate from the text-image ID classifier
                     loss_tri = self.triplet(io_emb, io_pids)
-                    loss_io_id = self.id_loss.classifier(io_emb)
-                    loss_io_id = torch.nn.functional.cross_entropy(loss_io_id, io_pids)
-                    loss = loss + w_img * (loss_tri + loss_io_id)
+                    loss = loss + w_img * loss_tri
 
             loss_scaled = loss / accum
             if scaler:
@@ -229,10 +284,18 @@ class Trainer:
                     self.writer.add_scalar("train/lr_backbone", lr_bb, self.global_step)
                     self.writer.add_scalar("train/lr_heads", lr_hd, self.global_step)
                     self.writer.add_scalar("train/temperature", temp, self.global_step)
+                    mlm_str = ""
+                    if loss_mlm is not None:
+                        self.writer.add_scalar("train/loss_mlm", loss_mlm.item(), self.global_step)
+                        mlm_str = f" mlm={loss_mlm.item():.4f}"
+                    tri_str = ""
+                    if self.use_image_only:
+                        self.writer.add_scalar("train/loss_tri", loss_tri.item(), self.global_step)
+                        tri_str = f" tri={loss_tri.item():.4f}"
                     print(
                         f"[E{epoch:02d} S{self.global_step:06d}] "
                         f"loss={loss.item():.4f} nce={loss_nce.item():.4f} "
-                        f"id={loss_id.item():.4f} temp={temp:.4f} "
+                        f"id={loss_id.item():.4f}{mlm_str}{tri_str} temp={temp:.4f} "
                         f"lr_bb={lr_bb:.2e}"
                     )
 
@@ -240,7 +303,8 @@ class Trainer:
     # Public API
     # ------------------------------------------------------------------
 
-    def train(self, evaluator=None, checkpoint_dir: str = "checkpoints"):
+    def train(self, evaluator=None, checkpoint_dir: str = "checkpoints",
+              start_epoch: int = 1):
         tcfg = self.cfg["training"]
         Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
@@ -255,7 +319,7 @@ class Trainer:
             amp_dtype = None  # FP32 (full precision)
             scaler = None
 
-        for epoch in range(1, tcfg["max_epochs"] + 1):
+        for epoch in range(start_epoch, tcfg["max_epochs"] + 1):
             t0 = time.time()
             self._train_epoch(epoch, scaler, amp_dtype)
             elapsed = time.time() - t0
