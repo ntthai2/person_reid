@@ -12,13 +12,14 @@ Supports:
 from __future__ import annotations
 
 import re
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional
 
 import scipy.io
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 
 from src.datasets.text_image import build_train_transform, build_val_transform
@@ -45,6 +46,74 @@ def collate_image_only(batch: list):
 
 
 # ---------------------------------------------------------------------------
+# PK Identity-balanced sampler (P identities × K images per identity)
+# ---------------------------------------------------------------------------
+
+class IdentityBalancedSampler(Sampler):
+    """Sample exactly K images per identity per batch over P identities.
+
+    Each iteration yields batch_size = P * K indices.  Identities with fewer
+    than K images are sampled with replacement.  Identities with no positive
+    counterpart (singletons) are kept so the triplet loss can still reject them,
+    but they don't drive learning.
+
+    Args:
+        dataset:     ConcatDataset (or any dataset) whose __getitem__ returns
+                     ImageSample objects.  We collect PIDs at construction.
+        pid_list:    Flat list of integer PIDs parallel to dataset indices.
+        num_instances (K): Images per identity per batch.
+        batch_size:  Must be divisible by num_instances; defines P = batch_size // K.
+    """
+
+    def __init__(
+        self,
+        pid_list: list[int],
+        num_instances: int = 4,
+        batch_size: int = 64,
+    ):
+        super().__init__()
+        self.num_instances = num_instances
+        self.batch_size = batch_size
+        self.P = batch_size // num_instances
+
+        # Group indices by pid
+        self._pid2indices: dict[int, list[int]] = defaultdict(list)
+        for idx, pid in enumerate(pid_list):
+            self._pid2indices[pid].append(idx)
+        self._pids = list(self._pid2indices.keys())
+        self._n_pids = len(self._pids)
+
+        # Number of batches ≈ unique identities / P
+        self._n_batches = max(1, self._n_pids // self.P)
+
+    def __len__(self) -> int:
+        # Number of batches (batch_sampler protocol)
+        return self._n_batches
+
+    def __iter__(self):
+        import random
+        pids_shuffled = self._pids.copy()
+        random.shuffle(pids_shuffled)
+
+        batch: list[int] = []
+        for pid in pids_shuffled:
+            indices = self._pid2indices[pid]
+            if len(indices) >= self.num_instances:
+                chosen = random.sample(indices, self.num_instances)
+            else:
+                # Sample with replacement when not enough images
+                chosen = random.choices(indices, k=self.num_instances)
+            batch.extend(chosen)
+            if len(batch) >= self.batch_size:
+                yield batch[: self.batch_size]    # yield the full batch as a list
+                batch = batch[self.batch_size :]
+
+        # Yield last partial batch if present
+        if batch:
+            yield batch
+
+
+# ---------------------------------------------------------------------------
 # DukeMTMC-reID / Market-1203  (shared naming convention)
 # ---------------------------------------------------------------------------
 # File naming: {pid:04d}_{camid:02d}_{seq:06d}_{frame:06d}.jpg
@@ -55,12 +124,23 @@ def collate_image_only(batch: list):
 _PID_RE = re.compile(r"^(\d+)_")
 
 
+_CAMID_DIGITS_RE = re.compile(r"c(\d+)")
+
+
 def _parse_pid_camid_duke(fname: str):
-    """Parse pid and camid from DukeMTMC-reID filename."""
-    # e.g. 0001_c1_f0044158.jpg
+    """Parse pid and camid from DukeMTMC-reID / ENTIRe-ID filename.
+
+    Handles:
+      Duke:      ``0001_c1_f0044158.jpg``  → pid=1,  cam=1
+      ENTIRe-ID: ``00000_c021s0_549866.jpg`` → pid=0, cam=21
+    """
     parts = Path(fname).stem.split("_")
     pid = int(parts[0])
-    camid = int(parts[1][1:]) if len(parts) > 1 else -1
+    if len(parts) > 1:
+        m = _CAMID_DIGITS_RE.match(parts[1])
+        camid = int(m.group(1)) if m else -1
+    else:
+        camid = -1
     return pid, camid
 
 
@@ -100,6 +180,11 @@ class FolderReIDDataset(Dataset):
 
     def __len__(self):
         return len(self.paths)
+
+    @property
+    def pids(self) -> list[int]:
+        """Flat list of integer PIDs parallel to dataset indices."""
+        return [self.pid_map[self.parser(p.name)[0]] for p in self.paths]
 
     def __getitem__(self, idx: int):
         p = self.paths[idx]
@@ -167,6 +252,10 @@ class LaSTDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @property
+    def pids(self) -> list[int]:
+        return [s[1] for s in self.samples]
+
     def __getitem__(self, idx: int):
         path, pid = self.samples[idx]
         image = Image.open(path).convert("RGB")
@@ -174,17 +263,30 @@ class LaSTDataset(Dataset):
             image = self.transform(image)
         return ImageSample(image, pid)
 
-
 # ---------------------------------------------------------------------------
-# CAVIARa  (flat folder, e.g. personXXX_frameYYY.png)
+# CAVIARa  (flat folder: {pid:04d}{frame:03d}.jpg  or  personXXX_frameYYY.png)
 # ---------------------------------------------------------------------------
-
-_CAVIAR_PID_RE = re.compile(r"person(\d+)", re.IGNORECASE)
-
 
 def _parse_caviar_pid(fname: str) -> int:
-    m = _CAVIAR_PID_RE.search(fname)
-    return int(m.group(1)) if m else -1
+    """Extract person ID from a CAVIARa filename.
+
+    Supports two formats:
+      1. ``0012003.jpg``  — first 4 digits = pid, last 3 = frame (no separator)
+      2. ``person012_frame003.png``  — legacy format with 'person' prefix
+    """
+    stem = Path(fname).stem
+    if stem.isdigit() and len(stem) == 7:
+        # Format 1: PPPPFFF (4 pid digits + 3 frame digits)
+        return int(stem[:4])
+    m = re.search(r"person(\d+)", fname, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    # Fallback: try leading digits
+    m = re.match(r"(\d+)", stem)
+    if m:
+        # Heuristic: if remaining string starts with digit, take first 4 chars as pid
+        return int(stem[:4]) if len(stem) >= 4 else int(m.group(1))
+    raise ValueError(f"Cannot parse PID from CAVIARa filename: {fname}")
 
 
 class CAVIARaDataset(Dataset):
@@ -203,6 +305,10 @@ class CAVIARaDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    @property
+    def pids(self) -> list[int]:
+        return [s[1] for s in self.samples]
 
     def __getitem__(self, idx: int):
         path, pid = self.samples[idx]
@@ -249,6 +355,54 @@ class GRIDDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    @property
+    def pids(self) -> list[int]:
+        return [s[1] for s in self.samples]
+
+    def __getitem__(self, idx: int):
+        path, pid = self.samples[idx]
+        image = Image.open(path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return ImageSample(image, pid)
+
+
+# ---------------------------------------------------------------------------
+# WARD  (flat folder: {pid:04d}{cam:04d}{frame:04d}.png)
+# ---------------------------------------------------------------------------
+
+class WARDDataset(Dataset):
+    """WARD multi-camera pedestrian dataset.
+
+    Filenames: ``{pid:04d}{cam:04d}{frame:04d}.png``, e.g. ``000100010001.png``.
+    70 identities × 3 cameras × ~23 frames ≈ 4,786 total images.
+    """
+
+    def __init__(self, img_dir: str, pid_offset: int = 0, transform=None):
+        paths = sorted(
+            p for p in Path(img_dir).iterdir()
+            if p.suffix.lower() in {".png", ".jpg", ".jpeg"}
+        )
+
+        def _parse(fname: str) -> tuple[int, int]:
+            stem = Path(fname).stem  # 12 digits
+            pid = int(stem[:4])
+            cam = int(stem[4:8])
+            return pid, cam
+
+        raw_pids = sorted({_parse(p.name)[0] for p in paths})
+        pid_map = {raw: i + pid_offset for i, raw in enumerate(raw_pids)}
+        self.num_pids = len(raw_pids)
+        self.samples = [(p, pid_map[_parse(p.name)[0]]) for p in paths]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.samples)
+
+    @property
+    def pids(self) -> list[int]:
+        return [s[1] for s in self.samples]
+
     def __getitem__(self, idx: int):
         path, pid = self.samples[idx]
         image = Image.open(path).convert("RGB")
@@ -265,7 +419,7 @@ def build_image_only_dataset(cfg, split: str = "train"):
     """Build a list of enabled image-only datasets with cumulative pid offsets."""
     is_train = split == "train"
     icfg = cfg["data"]["image_only"]
-    image_size = cfg["model"]["image_size"]
+    image_size = cfg["data"]["image_size"]  # data.image_size (not model.image_size)
     transform = build_train_transform(image_size) if is_train \
         else build_val_transform(image_size)
 
@@ -293,6 +447,12 @@ def build_image_only_dataset(cfg, split: str = "train"):
     if icfg["caviar"]["enabled"]:
         ds = CAVIARaDataset(icfg["caviar"]["img_dir"], pid_offset=offset,
                              transform=transform)
+        datasets.append(ds)
+        offset += ds.num_pids
+
+    if icfg.get("ward", {}).get("enabled", False):
+        ds = WARDDataset(icfg["ward"]["img_dir"], pid_offset=offset,
+                         transform=transform)
         datasets.append(ds)
         offset += ds.num_pids
 

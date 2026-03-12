@@ -17,6 +17,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
@@ -128,55 +129,63 @@ class CUHKPEDESDataset(Dataset):
             image = self._transform(image)
         return Sample(image, text, pid=-1)
 
-    def __len__(self):
-        return len(self._ds)
-
-    def __getitem__(self, idx: int):
-        import io
-        row = self._ds[idx]
-        img_data = row[self._img_col]
-        text = str(row[self._txt_col]).strip()
-
-        if isinstance(img_data, Image.Image):
-            image = img_data.convert("RGB")
-        elif isinstance(img_data, dict):
-            raw = img_data.get("bytes") or img_data.get("path")
-            image = Image.open(io.BytesIO(raw)).convert("RGB") if isinstance(raw, bytes) \
-                else Image.open(raw).convert("RGB")
-        elif isinstance(img_data, bytes):
-            image = Image.open(io.BytesIO(img_data)).convert("RGB")
-        elif isinstance(img_data, np.ndarray):
-            image = Image.fromarray(img_data).convert("RGB")
-        else:
-            image = img_data.convert("RGB")
-
-        if self._transform:
-            image = self._transform(image)
-        return Sample(image, text, pid=-1)
-
 
 # ---------------------------------------------------------------------------
 # ICFG-PEDES — cleaned CSV
 # ---------------------------------------------------------------------------
 
 class ICFGPEDESDataset(Dataset):
-    """Loads ICFG-PEDES from captions_cleaned.csv.
+    """Loads ICFG-PEDES from captions_cleaned.csv (training) or ICFG-PEDES.json
+    (evaluation with proper split filtering).
+
+    When json_path is provided the split argument is used to filter records
+    (train: 34,674 / test: 19,848).  When only csv_path is provided the split
+    argument is ignored and all rows are returned (for training backwards
+    compatibility).
 
     CSV columns: image, caption, id
-    The 'image' column contains Windows absolute paths; we strip everything
-    before 'imgs/' and resolve it relative to img_root.
+    JSON schema: [{split, file_path, id, captions:[str]}]
     """
 
     _WIN_PREFIX_RE = re.compile(r".*[/\\]imgs[/\\]", re.IGNORECASE)
 
-    def __init__(self, csv_path: str, img_root: str,
-                 split: Optional[str] = "train", transform=None):
-        df = pd.read_csv(csv_path, dtype=str)
-        df["_rel"] = df["image"].apply(self._strip_prefix)
-        df["_pid"] = df["id"].astype(int)
-        self.df = df.reset_index(drop=True)
+    def __init__(self, csv_path: Optional[str] = None,
+                 img_root: str = "",
+                 split: Optional[str] = "train",
+                 transform=None,
+                 json_path: Optional[str] = None):
         self.img_root = Path(img_root)
         self.transform = transform
+        self._records: list[tuple[str, str, int]] = []  # (rel_path, caption, pid)
+
+        if json_path is not None:
+            # JSON-based loading: proper split filtering
+            with open(json_path) as f:
+                data = json.load(f)
+            img_root_path = Path(img_root)
+            skipped = 0
+            for item in data:
+                if split is not None and item.get("split", "train") != split:
+                    continue
+                rel = item["file_path"]
+                if not (img_root_path / rel).exists():
+                    skipped += 1
+                    continue
+                captions = item["captions"]
+                caption = captions[0] if isinstance(captions, list) else captions
+                self._records.append((rel, caption, int(item["id"])))
+            if skipped:
+                print(f"ICFGPEDESDataset ({split}): skipped {skipped} missing images "
+                      f"({len(self._records)} available)")
+        elif csv_path is not None:
+            # CSV-based loading: no split info available, load all
+            df = pd.read_csv(csv_path, dtype=str)
+            df["_rel"] = df["image"].apply(self._strip_prefix)
+            df["_pid"] = df["id"].astype(int)
+            for _, row in df.iterrows():
+                self._records.append((row["_rel"], row["caption"], int(row["_pid"])))
+        else:
+            raise ValueError("ICFGPEDESDataset: provide either csv_path or json_path")
 
     @classmethod
     def _strip_prefix(cls, path: str) -> str:
@@ -185,18 +194,26 @@ class ICFGPEDESDataset(Dataset):
             rel = path[m.end():]
         else:
             rel = Path(path).name
-        # Convert any remaining Windows backslashes to forward slashes
         return rel.replace("\\", "/")
 
+    @property
+    def samples(self) -> list:
+        """Expose records as `samples` for evaluator fast-path compatibility.
+
+        Each element is (rel_path, caption_str, pid) — matching RSTPReidDataset
+        tuple layout so the evaluator can extract texts/pids without image I/O.
+        """
+        return self._records
+
     def __len__(self):
-        return len(self.df)
+        return len(self._records)
 
     def __getitem__(self, idx: int):
-        row = self.df.iloc[idx]
-        image = Image.open(self.img_root / row["_rel"]).convert("RGB")
+        rel_path, caption, pid = self._records[idx]
+        image = Image.open(self.img_root / rel_path).convert("RGB")
         if self.transform:
             image = self.transform(image)
-        return Sample(image, row["caption"], row["_pid"])
+        return Sample(image, caption, pid)
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +356,7 @@ def _remap_dataset_pids(dataset, offset: int = 0) -> int:
     """
     # Collect all unique valid pids
     if isinstance(dataset, ICFGPEDESDataset):
-        raw_pids = dataset.df["_pid"].values
+        raw_pids = [r[2] for r in dataset._records]
     elif isinstance(dataset, (RSTPReidDataset, ORBenchDataset)):
         raw_pids = [s[2] for s in dataset.samples]
     else:
@@ -352,9 +369,10 @@ def _remap_dataset_pids(dataset, offset: int = 0) -> int:
 
     # Apply remapping in place
     if isinstance(dataset, ICFGPEDESDataset):
-        dataset.df["_pid"] = dataset.df["_pid"].map(
-            lambda p: pid_map.get(p, -1)
-        )
+        dataset._records = [
+            (path, cap, pid_map.get(pid, -1))
+            for path, cap, pid in dataset._records
+        ]
     else:
         dataset.samples = [
             (path, cap, pid_map.get(pid, -1))
@@ -391,11 +409,26 @@ def build_text_image_dataset(cfg, split: str = "train"):
         ))
 
     if tcfg["icfg_pedes"]["enabled"]:
-        datasets.append(ICFGPEDESDataset(
-            csv_path=tcfg["icfg_pedes"]["csv"],
-            img_root=tcfg["icfg_pedes"]["img_root"],
-            transform=transform,
-        ))
+        # Use JSON with split="train" to avoid test-set leakage.
+        # The captions_cleaned.csv includes all available images regardless
+        # of split; the ICFG-PEDES.json has proper split metadata.
+        icfg_json = tcfg["icfg_pedes"].get("json")
+        if icfg_json and is_train:
+            datasets.append(ICFGPEDESDataset(
+                json_path=icfg_json,
+                img_root=tcfg["icfg_pedes"]["img_root"],
+                split="train",
+                transform=transform,
+            ))
+        elif not is_train:
+            pass  # ICFG eval handled by evaluator with split="test"
+        else:
+            # Fallback: CSV-based (legacy, no split filter)
+            datasets.append(ICFGPEDESDataset(
+                csv_path=tcfg["icfg_pedes"]["csv"],
+                img_root=tcfg["icfg_pedes"]["img_root"],
+                transform=transform,
+            ))
 
     if tcfg["rstp_reid"]["enabled"]:
         datasets.append(RSTPReidDataset(

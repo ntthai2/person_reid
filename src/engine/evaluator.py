@@ -8,13 +8,15 @@ Supports:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 import faiss
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from transformers import CLIPProcessor
 
 from src.datasets.text_image import (
@@ -27,15 +29,57 @@ from src.datasets.text_image import (
 
 
 # ---------------------------------------------------------------------------
+# ORBench gallery dataset (module-level so DataLoader multi-processing can pickle it)
+# ---------------------------------------------------------------------------
+
+class _ORBenchGalleryDataset(Dataset):
+    """Minimal dataset for ORBench RGB gallery images.
+
+    Defined at module level so it can be pickled by DataLoader worker processes.
+    """
+
+    def __init__(self, items, img_root, transform):
+        self.items = items           # list of [pid, rel_path]
+        self.img_root = img_root     # pathlib.Path to ORBench data root
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, idx):
+        pid, path = self.items[idx]
+        image = Image.open(self.img_root / path).convert("RGB")
+        if self.transform:
+            image = self.transform(image)
+        return image, pid
+
+
+def _collate_orbench(batch):
+    imgs = torch.stack([b[0] for b in batch])
+    pids = torch.tensor([b[1] for b in batch], dtype=torch.long)
+    return imgs, pids
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
 def _embed_images(model, loader, device) -> tuple[np.ndarray, np.ndarray]:
+    """Embed images from a DataLoader, handling two collate formats:
+
+    - text-image: (images_tensor, texts_list, pids_tensor) → batch[1] is list
+    - image-only: (images_tensor, pids_tensor, camids_tensor) → batch[1] is tensor
+    """
     model.eval()
     all_embs, all_pids = [], []
     for batch in loader:
-        images, _, pids = batch
+        images = batch[0]
+        # Distinguish collate_text_image (texts as list) from collate_image_only (tensor)
+        if isinstance(batch[1], torch.Tensor):
+            pids = batch[1]   # image-only: (images, pids, camids)
+        else:
+            pids = batch[2]   # text-image: (images, texts, pids)
         images = images.to(device)
         emb = model.encode_image(images)
         all_embs.append(emb.cpu().float().numpy())
@@ -73,15 +117,25 @@ def _build_faiss_index(gallery_embs: np.ndarray,
 
 
 def _compute_metrics(query_pids: np.ndarray, gallery_pids: np.ndarray,
-                     indices: np.ndarray, k_values: list[int]) -> dict:
-    """Compute Rank-K accuracy and mAP from retrieved indices."""
+                     indices: np.ndarray, k_values: list[int],
+                     exclude_self: bool = False) -> dict:
+    """Compute Rank-K accuracy and mAP from retrieved indices.
+
+    Args:
+        exclude_self: When query == gallery set, skip the rank-1 match that
+                      corresponds to each query's own index (query_idx == gallery_idx).
+    """
     max_k = indices.shape[1]
     ranks_hit = {k: 0 for k in k_values}
     ap_sum = 0.0
     n = len(query_pids)
 
     for i, qpid in enumerate(query_pids):
-        retrieved = gallery_pids[indices[i]]  # (K,)
+        retrieved_indices = indices[i]
+        if exclude_self:
+            # Remove self-match (the query image itself is in the gallery)
+            retrieved_indices = retrieved_indices[retrieved_indices != i]
+        retrieved = gallery_pids[retrieved_indices]  # (K,)
         correct = (retrieved == qpid)
 
         # Rank-K
@@ -136,11 +190,16 @@ class Evaluator:
                 split="test", transform=transform, deterministic=True,
             )
         elif dataset_name == "icfg_pedes":
+            icfg_cfg = cfg["data"]["text_image"]["icfg_pedes"]
             gallery_ds = ICFGPEDESDataset(
-                csv_path=cfg["data"]["text_image"]["icfg_pedes"]["csv"],
-                img_root=cfg["data"]["text_image"]["icfg_pedes"]["img_root"],
+                json_path=icfg_cfg.get("json"),  # proper split filtering
+                csv_path=icfg_cfg.get("csv") if not icfg_cfg.get("json") else None,
+                img_root=icfg_cfg["img_root"],
+                split="test",
                 transform=transform,
             )
+        elif dataset_name == "orbench":
+            return self._eval_orbench_text2image(model, processor, transform)
         else:
             raise ValueError(f"Unknown eval dataset: {dataset_name}")
 
@@ -152,20 +211,79 @@ class Evaluator:
         # Embed gallery images
         gallery_embs, gallery_pids = _embed_images(model, loader, self.device)
 
-        # Embed query texts (one per gallery sample, same order)
-        query_texts = [s.text for s in gallery_ds]   # type: ignore[attr-defined]
-        query_pids = gallery_pids.copy()
-
-        # If the dataset provides a list interface iterate directly
-        try:
+        # Extract query texts + pids from stored metadata (avoids re-loading images).
+        # When multiple captions exist per image (like RSTPReid's 2 per image),
+        # expand each caption as a separate query — the standard protocol.
+        if hasattr(gallery_ds, "samples") and gallery_ds.samples:
+            # RSTPReidDataset / ICFGPEDESDataset: samples = [(img_path, caption_or_list, pid)]
+            query_texts, query_pid_list = [], []
+            for gidx, s in enumerate(gallery_ds.samples):
+                caps = s[1] if isinstance(s[1], list) else [s[1]]
+                for cap in caps:
+                    query_texts.append(cap)
+                    query_pid_list.append(gallery_pids[gidx])
+            query_pids = np.array(query_pid_list, dtype=np.int64)
+        else:
+            # Fallback: attribute access (slow path, kept for compatibility)
             query_texts = [gallery_ds[i].text for i in range(len(gallery_ds))]
-            query_pids = np.array([gallery_ds[i].pid for i in range(len(gallery_ds))])
-        except Exception:
-            pass
+            query_pids = gallery_pids.copy()
 
         query_embs = _embed_texts(model, processor, query_texts, self.device)
 
         # FAISS search
+        index = _build_faiss_index(gallery_embs, self.faiss_gpu)
+        max_k = max(self.k_values)
+        _, indices = index.search(query_embs.astype(np.float32), max_k)
+
+        return _compute_metrics(query_pids, gallery_pids, indices, self.k_values)
+
+    def _eval_orbench_text2image(self, model, processor, transform) -> dict:
+        """Evaluate on ORBench RGB text→image benchmark.
+
+        The test JSON has separate RGB_GALLERY (image paths+pids) and TEXT (descriptions+pids)
+        lists, unlike RSTPReid where both come from the same sample list.
+        """
+        cfg = self.cfg
+        orbench_cfg = cfg["data"]["text_image"]["orbench"]
+        test_json = orbench_cfg.get("test_json")
+        if test_json is None:
+            # Derive test_json path from training json if not explicitly set
+            train_json = Path(orbench_cfg["json"])
+            test_json = str(train_json.parent / "test_gallery_and_queries.json")
+
+        img_root = Path(orbench_cfg["img_root"])
+
+        with open(test_json) as f:
+            test_data = json.load(f)
+
+        gallery_items = test_data["RGB_GALLERY"]   # [[pid, file_path], ...]
+        text_items = test_data["TEXT"]              # [[pid, description], ...]
+
+        gallery_ds = _ORBenchGalleryDataset(gallery_items, img_root, transform)
+        gallery_loader = DataLoader(
+            gallery_ds, batch_size=128, shuffle=False, num_workers=4,
+            collate_fn=_collate_orbench,
+        )
+
+        # Embed gallery images (reuse _embed_images helper which expects (img, _, pid) tuples)
+        # Use a custom embedding loop since our Dataset returns (img, pid) not (img, text, pid)
+        model.eval()
+        all_embs, all_pids = [], []
+        with torch.no_grad():
+            for imgs, pids in gallery_loader:
+                imgs = imgs.to(self.device)
+                emb = model.encode_image(imgs)
+                all_embs.append(emb.cpu().float().numpy())
+                all_pids.append(pids.numpy())
+        gallery_embs = np.concatenate(all_embs)
+        gallery_pids = np.concatenate(all_pids)
+
+        # Extract text queries
+        query_texts = [desc for _, desc in text_items]
+        query_pids = np.array([pid for pid, _ in text_items], dtype=np.int64)
+
+        query_embs = _embed_texts(model, processor, query_texts, self.device)
+
         index = _build_faiss_index(gallery_embs, self.faiss_gpu)
         max_k = max(self.k_values)
         _, indices = index.search(query_embs.astype(np.float32), max_k)
@@ -195,14 +313,17 @@ class Evaluator:
                 num_workers=4, collate_fn=collate_image_only,
             )
             query_embs, query_pids = _embed_images(model, query_loader, self.device)
+            exclude_self = False
         else:
             query_embs, query_pids = gallery_embs, gallery_pids
+            exclude_self = True  # avoid trivial self-match
 
         index = _build_faiss_index(gallery_embs, self.faiss_gpu)
-        max_k = max(self.k_values)
+        max_k = max(self.k_values) + (1 if exclude_self else 0)  # +1 to account for self
         _, indices = index.search(query_embs.astype(np.float32), max_k)
 
-        return _compute_metrics(query_pids, gallery_pids, indices, self.k_values)
+        return _compute_metrics(query_pids, gallery_pids, indices, self.k_values,
+                                exclude_self=exclude_self)
 
     # ------------------------------------------------------------------
     # Public API
@@ -215,15 +336,29 @@ class Evaluator:
         metrics.update({f"text2img/{k}": v for k, v in ti_metrics.items()})
         print(f"Text→Image ({primary}): {ti_metrics}")
 
+        # Optional secondary text→image datasets (e.g. orbench)
+        for secondary in self.cfg["evaluation"].get("secondary_text_image", []):
+            sec_metrics = self._eval_text2image(model, secondary)
+            metrics.update({f"text2img/{secondary}/{k}": v for k, v in sec_metrics.items()})
+            print(f"Text→Image ({secondary}): {sec_metrics}")
+
         if self.cfg["evaluation"]["eval_image_reid"]:
-            duke_cfg = self.cfg["data"]["image_only"]["duke"]
-            if duke_cfg["enabled"]:
+            # Prefer new image_reid_datasets section; fall back to old duke config
+            ii_datasets = self.cfg["evaluation"].get("image_reid_datasets")
+            if ii_datasets is None:
+                duke_cfg = self.cfg["data"]["image_only"]["duke"]
+                ii_datasets = {"duke": {
+                    "gallery_dir": duke_cfg["gallery_dir"],
+                    "query_dir": duke_cfg.get("query_dir"),
+                }} if duke_cfg.get("enabled") else {}
+
+            for name, ds_cfg in ii_datasets.items():
                 ii_metrics = self._eval_image2image(
                     model,
-                    img_dir=duke_cfg["gallery_dir"],
-                    query_dir=duke_cfg["query_dir"],
+                    img_dir=ds_cfg["gallery_dir"],
+                    query_dir=ds_cfg.get("query_dir"),
                 )
-                metrics.update({f"img2img/duke/{k}": v for k, v in ii_metrics.items()})
-                print(f"Image→Image (DukeMTMC): {ii_metrics}")
+                metrics.update({f"img2img/{name}/{k}": v for k, v in ii_metrics.items()})
+                print(f"Image→Image ({name}): {ii_metrics}")
 
         return metrics
