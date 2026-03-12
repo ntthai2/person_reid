@@ -48,7 +48,7 @@ def main():
     print(f"Using device: {device}")
 
     model = build_model(cfg).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt.get("model", ckpt)  # handle both wrapped and bare state dicts
     model.load_state_dict(state)
     print(f"Loaded checkpoint: {args.checkpoint}")
