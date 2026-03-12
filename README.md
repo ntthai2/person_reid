@@ -30,15 +30,15 @@ The model should generalize across cameras, viewpoints, and lighting conditions.
 
 | Dataset | Identities | Images | Notes |
 |---|---|---|---|
-| DukeMTMC-reID | 1,812 | ~36K | Multi-camera; `bounding_box_train/` with `{pid}_{camid}_*.jpg` naming |
-| Market-1203 | 1,203 | ~12K | Orientation-labeled; 128×64 px crops; images under `Market1203/` subfolder |
-| LaST | 4,000+ | ~228K | Long-term, clothing change; identity subfolders under `train/`, `val/` |
-| CAVIARa | ~72 | ~13K | Indoor surveillance benchmark; flat folder |
-| GRID (underground_reid) | 250 | ~1,275 | CCTV/underground; splits in `features_and_partitions.mat` |
-| ENTIRe-ID | — | test only | Held-out benchmark |
+| DukeMTMC-reID | 702 | 16,522 | Multi-camera; `bounding_box_train/` with `{pid}_{camid}_*.jpg` naming |
+| Market-1203 | 1,203 | 8,569 | Orientation-labeled; images directly in `Market1203/` subfolder |
+| LaST | 5,000 | 71,248 | Long-term, clothing change; identity subfolders under `train/` |
+| CAVIARa | 72 | 1,220 | Indoor surveillance benchmark; flat folder |
+| WARD | 70 | 4,786 | Multi-camera pedestrian (3 cams × ~23 frames/id); flat folder |
+| GRID (underground_reid) | 250 | ~1,275 | CCTV/underground; disabled for triplet (250 singletons probe); eval-only |
+| ENTIRe-ID | — | 10,415 (test) | Held-out benchmark; no train split |
 
-> **Excluded**: V-47_Images (synthetic, unlabeled), ORBench IR images — out of RGB scope. ORBench `vis/` RGB images **are included** in text+image training.
-> **Note**: WARD dataset has no text annotations and is excluded.
+> **Excluded from training**: V-47_Images (synthetic, unlabeled), ORBench IR/NIR images — out of RGB scope. ORBench `vis/` RGB images **are included** in text+image training.
 
 ---
 
@@ -63,19 +63,24 @@ person_reid/
 ├── src/
 │   ├── datasets/
 │   │   ├── text_image.py    # Loaders: CUHK-PEDES (HF Arrow), ICFG-PEDES (CSV), RSTPReid, IIITD-20K, ORBench
-│   │   └── image_only.py    # Loaders: DukeMTMC, Market, LaST, CAVIARa, GRID
+│   │   └── image_only.py    # Loaders: DukeMTMC, Market, LaST, CAVIARa, WARD, GRID; IdentityBalancedSampler
 │   ├── models/
-│   │   └── dual_encoder.py  # CLIP ViT-B/16 + MLP projection heads; BF16-safe
+│   │   ├── dual_encoder.py  # CLIP ViT-B/16 + MLP projection heads; BF16-safe
+│   │   └── local_align.py   # Phase 2: cross-attention (text→image patches) + MLM head
 │   ├── losses/
 │   │   └── contrastive.py   # InfoNCE (symmetric), IDLoss (masked), TripletLoss (batch-hard)
 │   └── engine/
 │       ├── trainer.py       # Training loop: BF16 AMP, cosine+warmup LR, gradient accumulation
 │       └── evaluator.py     # FAISS FlatIP retrieval; Rank-K + mAP; text→image + image→image
 ├── configs/
-│   └── baseline.yaml        # All hyperparameters, dataset paths, model spec
+│   ├── baseline.yaml        # Phase 1: all hyperparameters, dataset paths, model spec
+│   ├── local_align.yaml     # Phase 2: + cross-attention LocalAlignModule + MLM loss
+│   └── multitask.yaml       # Phase 3: + image-only triplet loss (lambda_img=0.3)
 ├── scripts/
-│   ├── train.py             # python scripts/train.py --config configs/baseline.yaml [--smoke-test] [--resume PATH]
-│   └── eval.py              # python scripts/eval.py --config configs/baseline.yaml --checkpoint PATH
+│   ├── train.py             # python scripts/train.py --config ... [--smoke-test] [--resume PATH] [--init-from PATH]
+│   ├── eval.py              # python scripts/eval.py --config ... --checkpoint PATH
+│   ├── eval_sweep.py        # Evaluate all checkpoints in a directory; print per-epoch summary table
+│   └── auto_eval.sh         # Wait for N checkpoints to appear then trigger eval_sweep
 ├── outputs/                 # Checkpoints (ckpt_epoch{N:02d}.pt)
 ├── runs/                    # TensorBoard logs
 ├── README.md
